@@ -1,182 +1,99 @@
 import streamlit as st
-import hashlib
-import sqlite3
 from binance.client import Client
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
+import ta
 import time
 
-# --------------- User Authentication Setup ----------------
-conn = sqlite3.connect('users.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)''')
-conn.commit()
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_password(password, hashed):
-    return hash_password(password) == hashed
-
-def add_user(username, password):
-    hashed = hash_password(password)
-    c.execute("INSERT OR REPLACE INTO users (username, password) VALUES (?, ?)", (username, hashed))
-    conn.commit()
-
-def get_user(username):
-    c.execute("SELECT * FROM users WHERE username=?", (username,))
-    return c.fetchone()
-
-def update_password(username, new_password):
-    hashed = hash_password(new_password)
-    c.execute("UPDATE users SET password=? WHERE username=?", (hashed, username))
-    conn.commit()
-
-if not get_user("abdi"):
-    add_user("abdi", "sir1234")
-
-# ---------------- Binance API Setup ---------------------
-# Use Binance public API - no keys required for public data
+# Binance API (public data, API key iyo secret uma baahnid haddii aad read-only xog raadineyso)
 client = Client()
 
-# Timeframes supported by Binance for Klines
-TIMEFRAMES = {
-    '1m': '1m',
-    '3m': '3m',
-    '5m': '5m',
-    '15m': '15m',
-    '30m': '30m',
-    '1h': '1h',
-    '2h': '2h',
-    '4h': '4h',
-    '6h': '6h',
-    '8h': '8h',
-    '12h': '12h',
-    '1d': '1d',
-    '3d': '3d',
-    '1w': '1w',
-    '1M': '1M'
-}
+# Timeframes Binance taageerto (waxaad ku dari kartaa kuwa kale)
+TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
 
-# ------------------ Helper functions --------------------
-def fetch_symbols():
+st.title("NunowCrypto - Crypto Signal Bot")
+
+# Hel dhammaan symbols (tokens) ee Binance Futures (ama Spot market)
+@st.cache_data(ttl=600)
+def get_symbols():
     info = client.get_exchange_info()
-    symbols = [s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING']
-    # Filter to spot markets only (optional)
-    spot_symbols = [sym for sym in symbols if sym.endswith('USDT')]
-    return spot_symbols
+    symbols = [s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT']
+    return symbols
 
+symbols = get_symbols()
+
+# User input
+selected_symbol = st.selectbox("Choose symbol:", symbols)
+selected_tf = st.selectbox("Choose timeframe:", TIMEFRAMES)
+
+# Function to get historical klines data
+@st.cache_data(ttl=300)
 def get_klines(symbol, interval, limit=500):
-    try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 'volume',
-                                           'close_time', 'quote_asset_volume', 'number_of_trades',
-                                           'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-        df['open'] = df['open'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['close'] = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-        return df
-    except Exception as e:
-        st.error(f"Error fetching klines: {e}")
-        return None
-
-def calculate_indicators(df):
-    df['RSI'] = ta.rsi(df['close'], length=14)
-    macd = ta.macd(df['close'])
-    df['MACD'] = macd['MACD_12_26_9']
-    df['MACD_signal'] = macd['MACDs_12_26_9']
-    df['MACD_hist'] = macd['MACDh_12_26_9']
+    klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=['Open time', 'Open', 'High', 'Low', 'Close', 'Volume',
+                                       'Close time', 'Quote asset volume', 'Number of trades',
+                                       'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'])
+    df['Open time'] = pd.to_datetime(df['Open time'], unit='ms')
+    df['Close time'] = pd.to_datetime(df['Close time'], unit='ms')
+    df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
     return df
 
+# Calculate indicators (RSI and MACD)
+def add_indicators(df):
+    df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
+    macd = ta.trend.MACD(df['Close'])
+    df['MACD'] = macd.macd()
+    df['MACD_signal'] = macd.macd_signal()
+    df['MACD_diff'] = macd.macd_diff()
+    return df
+
+# Simple signal strategy (buy/sell based on RSI and MACD cross)
 def generate_signal(df):
-    # Simple signal logic combining RSI and MACD
-    if df is None or df.empty:
-        return "No data"
-    last_rsi = df['RSI'].iloc[-1]
-    last_macd = df['MACD'].iloc[-1]
-    last_macd_signal = df['MACD_signal'].iloc[-1]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    # RSI signals
-    if last_rsi < 30:
-        rsi_signal = "Buy"
-    elif last_rsi > 70:
-        rsi_signal = "Sell"
-    else:
-        rsi_signal = "Hold"
+    signal = "Hold"
 
-    # MACD signals
-    if last_macd > last_macd_signal:
-        macd_signal = "Buy"
-    elif last_macd < last_macd_signal:
-        macd_signal = "Sell"
-    else:
-        macd_signal = "Hold"
+    # RSI oversold < 30, overbought > 70
+    if last['RSI'] < 30 and last['MACD_diff'] > 0 and prev['MACD_diff'] <= 0:
+        signal = "Buy"
+    elif last['RSI'] > 70 and last['MACD_diff'] < 0 and prev['MACD_diff'] >= 0:
+        signal = "Sell"
+    return signal
 
-    # Combine signals (simple logic)
-    if rsi_signal == "Buy" and macd_signal == "Buy":
-        return "Strong Buy"
-    elif rsi_signal == "Sell" and macd_signal == "Sell":
-        return "Strong Sell"
-    elif rsi_signal == "Buy" or macd_signal == "Buy":
-        return "Buy"
-    elif rsi_signal == "Sell" or macd_signal == "Sell":
-        return "Sell"
-    else:
-        return "Hold"
+if st.button("Get Signal"):
+    with st.spinner("Fetching data and calculating signals..."):
+        df = get_klines(selected_symbol, selected_tf)
+        df = add_indicators(df)
+        signal = generate_signal(df)
 
-# ---------------------- Streamlit UI ----------------------
-st.set_page_config(page_title="NunowCrypto", layout="wide")
-st.title("🔐 NunowCrypto - Crypto Signals Dashboard")
+        st.subheader(f"Latest Data for {selected_symbol} - {selected_tf}")
+        st.write(df.tail(5))
 
-menu = ["Login", "Change Password"]
-choice = st.sidebar.selectbox("Menu", menu)
+        st.markdown(f"### Trading Signal: **{signal}**")
 
-if choice == "Login":
-    st.subheader("Login to your dashboard")
-    username = st.text_input("Username")
-    password = st.text_input("Password", type='password')
+        st.markdown("### Indicator values:")
+        st.write(df[['RSI', 'MACD', 'MACD_signal', 'MACD_diff']].tail(5))
 
+# Add Change Password (simple session-based demo)
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+
+def login():
+    pw = st.text_input("Enter password:", type="password")
     if st.button("Login"):
-        user = get_user(username)
-        if user and verify_password(password, user[1]):
-            st.success(f"Welcome, {username}! 👋")
-
-            # Dashboard content starts here
-            st.header("📊 Crypto Signals")
-
-            symbols = fetch_symbols()
-            symbol = st.selectbox("Select Token (USDT pairs)", symbols, index=symbols.index("BTCUSDT") if "BTCUSDT" in symbols else 0)
-            timeframe = st.selectbox("Select Timeframe", list(TIMEFRAMES.keys()), index=5)  # default 1h
-
-            if st.button("Get Signal"):
-                with st.spinner("Fetching data and calculating signal..."):
-                    df = get_klines(symbol, TIMEFRAMES[timeframe])
-                    if df is not None:
-                        df = calculate_indicators(df)
-                        signal = generate_signal(df)
-                        st.write(f"### Signal for {symbol} on {timeframe} timeframe: **{signal}**")
-
-                        st.line_chart(df[['close', 'RSI', 'MACD', 'MACD_signal']])
-                    else:
-                        st.error("Failed to fetch or process data.")
-
+        if pw == "Nunow1234":  # Bad example, hardcoded password (for demo only)
+            st.session_state.logged_in = True
+            st.success("Logged in!")
         else:
-            st.error("Invalid username or password")
+            st.error("Wrong password!")
 
-elif choice == "Change Password":
-    st.subheader("Change Your Password")
-    username = st.text_input("Username")
-    old_password = st.text_input("Old Password", type='password')
-    new_password = st.text_input("New Password", type='password')
+if not st.session_state.logged_in:
+    st.sidebar.title("Login")
+    login()
+else:
+    st.sidebar.success("You are logged in")
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.experimental_rerun()
 
-    if st.button("Update Password"):
-        user = get_user(username)
-        if user and verify_password(old_password, user[1]):
-            update_password(username, new_password)
-            st.success("Password updated successfully!")
-        else:
-            st.error("Old password incorrect or user not found")

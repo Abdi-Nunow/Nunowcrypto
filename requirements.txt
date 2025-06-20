@@ -3,3 +3,5 @@ python-binance
 pandas
 numpy
 pandas_ta
+setuptools
+
